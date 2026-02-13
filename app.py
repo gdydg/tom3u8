@@ -8,19 +8,16 @@ import logging
 from flask import Flask, Response, request, render_template_string, send_from_directory, abort
 
 # --- 配置区域 ---
-# Render/Zeabur 会自动注入 PORT 环境变量，本地默认 8080
 PORT = int(os.environ.get('PORT', 8080))
 HLS_DIR = "hls_streams"
 FFMPEG_BIN = "ffmpeg"
 
 # 初始化 Flask
 app = Flask(__name__)
-# 减少日志噪音
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # 存储活跃的转码进程
-# 结构: {stream_id: {"process": subprocess.Popen, "last_access": time.time(), "source": url}}
 active_streams = {}
 
 # 启动时清理旧数据
@@ -28,7 +25,7 @@ if os.path.exists(HLS_DIR):
     shutil.rmtree(HLS_DIR)
 os.makedirs(HLS_DIR)
 
-# HTML 播放器模板 (支持移动端和PC)
+# HTML 播放器模板 (增加了错误处理提示)
 PLAYER_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -44,16 +41,17 @@ PLAYER_TEMPLATE = """
         input { width: 100%; padding: 12px; margin-bottom: 10px; border-radius: 6px; border: 1px solid #333; background: #2b2b36; color: white; box-sizing: border-box;}
         button { width: 100%; padding: 12px; cursor: pointer; background: #6c5ce7; color: white; border: none; border-radius: 6px; font-weight: bold; }
         button:hover { background: #5b4bc4; }
-        .video-wrapper { margin-top: 20px; border-radius: 8px; overflow: hidden; }
+        .video-wrapper { margin-top: 20px; border-radius: 8px; overflow: hidden; position: relative; min-height: 200px; background: #000;}
         .status { margin-top: 15px; font-size: 0.85em; color: #aaa; word-break: break-all; background: #25252b; padding: 10px; border-radius: 4px;}
+        .hint { color: #f39c12; font-size: 0.8em; margin-top: 5px; text-align: left;}
         a { color: #6c5ce7; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h2>RTP 直播流转码网关</h2>
+        <h2>RTP 直播流转码网关 (优化版)</h2>
         <form action="/play" method="get">
-            <input type="text" name="url" placeholder="输入 RTP/UDP 地址 (如 http://IP:PORT/rtp/...)" value="{{ source_url }}" required>
+            <input type="text" name="url" placeholder="输入 RTP/UDP 地址" value="{{ source_url }}" required>
             <button type="submit">开始播放 / 转换</button>
         </form>
         
@@ -67,6 +65,13 @@ PLAYER_TEMPLATE = """
             <strong>M3U8 链接:</strong> <br>
             <a href="{{ m3u8_url }}" target="_blank">{{ m3u8_url }}</a>
         </div>
+        <div class="hint">
+            <strong>注意：</strong>
+            <ul>
+                <li>如果画面黑屏但有声音：说明源是 H.265 编码，请复制 m3u8 链接使用 PotPlayer 或 VLC 播放。</li>
+                <li>如果加载慢：已增加缓冲时间以保证流畅度，请耐心等待 10-15 秒。</li>
+            </ul>
+        </div>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/video.js/7.20.3/video.min.js"></script>
         {% endif %}
     </div>
@@ -75,15 +80,13 @@ PLAYER_TEMPLATE = """
 """
 
 def get_stream_id(url):
-    """根据URL生成唯一的ID"""
     return hashlib.md5(url.encode('utf-8')).hexdigest()
 
 def clean_stale_streams():
-    """清理超过60秒没有被访问的流，防止云服务器资源耗尽"""
     now = time.time()
     to_remove = []
     for sid, data in active_streams.items():
-        if now - data["last_access"] > 60:  # 60秒超时
+        if now - data["last_access"] > 90:  # 延长超时时间到 90秒
             logger.info(f"Stream {sid} timed out, stopping...")
             try:
                 data["process"].terminate()
@@ -91,14 +94,13 @@ def clean_stale_streams():
             except:
                 data["process"].kill()
             to_remove.append(sid)
-            # 清理文件
             shutil.rmtree(os.path.join(HLS_DIR, sid), ignore_errors=True)
     
     for sid in to_remove:
         del active_streams[sid]
 
 def start_ffmpeg(source_url, stream_id):
-    clean_stale_streams() # 启动新流前尝试清理旧流
+    clean_stale_streams()
     
     output_dir = os.path.join(HLS_DIR, stream_id)
     if not os.path.exists(output_dir):
@@ -106,25 +108,39 @@ def start_ffmpeg(source_url, stream_id):
     
     playlist_path = os.path.join(output_dir, "index.m3u8")
     
-    # FFmpeg 命令优化：
-    # -c copy: 直接复制流，不消耗CPU进行转码
-    # -hls_time 2: 切片更小，延迟更低
-    # -hls_list_size 4: 列表只保留4个切片
+    # --- 核心优化配置 ---
     cmd = [
         FFMPEG_BIN,
         "-y",
+        
+        # 1. 输入流分析优化
+        "-fflags", "+genpts+discardcorrupt", # 丢弃损坏的包，重新生成时间戳
+        "-analyzeduration", "5000000",       # 分析 5秒 (提高识别率)
+        "-probesize", "5000000",             # 探测 5MB 数据
+        "-timeout", "5000000",               # 网络超时 5秒
+        
         "-i", source_url,
+        
+        # 2. 视频处理 (保持复制，否则 CPU 爆炸)
         "-c:v", "copy",
-        "-c:a", "copy",
+        
+        # 3. 音频处理 (关键优化：转码为 AAC)
+        # 解决源是 AC3/EAC3 导致浏览器无声的问题
+        "-c:a", "aac", 
+        "-b:a", "128k", 
+        "-ac", "2",      # 强制双声道
+        
+        # 4. HLS 切片优化 (以延迟换流畅)
         "-f", "hls",
-        "-hls_time", "2",
-        "-hls_list_size", "4",
-        "-hls_flags", "delete_segments+omit_endlist",
+        "-hls_time", "5",         # 切片改为 5秒 (原2秒) -> 更抗抖动
+        "-hls_list_size", "6",    # 列表保留 6个切片 (30秒缓冲)
+        "-hls_flags", "delete_segments+omit_endlist+split_by_time",
         "-hls_segment_filename", os.path.join(output_dir, "%03d.ts"),
+        
         playlist_path
     ]
 
-    logger.info(f"Starting FFmpeg: {source_url} -> {stream_id}")
+    logger.info(f"Starting FFmpeg (Optimized): {source_url} -> {stream_id}")
     process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     active_streams[stream_id] = {
@@ -145,26 +161,24 @@ def play():
     
     stream_id = get_stream_id(source_url)
     
-    # 检查进程是否存在且存活
     if stream_id in active_streams:
         if active_streams[stream_id]["process"].poll() is not None:
-            del active_streams[stream_id] # 进程已死，移除
+            del active_streams[stream_id]
         else:
-            active_streams[stream_id]["last_access"] = time.time() # 更新活跃时间
+            active_streams[stream_id]["last_access"] = time.time()
     
-    # 如果未运行，启动它
     if stream_id not in active_streams:
         start_ffmpeg(source_url, stream_id)
-        # 等待 FFmpeg 生成第一个切片，避免 404
-        retries = 20
+        # 增加等待时间，因为切片变大了
+        retries = 30 
         while retries > 0:
             if os.path.exists(os.path.join(HLS_DIR, stream_id, "index.m3u8")):
-                break
-            time.sleep(0.2)
+                # 再次检查文件大小，确保不是空文件
+                if os.path.getsize(os.path.join(HLS_DIR, stream_id, "index.m3u8")) > 0:
+                    break
+            time.sleep(0.5)
             retries -= 1
 
-    # 构造外部可访问的 URL
-    # 处理 HTTPS (Render/Zeabur 外部是 HTTPS，内部是 HTTP)
     scheme = "https" if request.headers.get('X-Forwarded-Proto') == 'https' else "http"
     m3u8_url = f"{scheme}://{request.host}/hls/{stream_id}/index.m3u8"
     
@@ -172,20 +186,16 @@ def play():
 
 @app.route('/hls/<stream_id>/<filename>')
 def serve_hls(stream_id, filename):
-    # 只要有请求拉取切片，就认为该流是活跃的
     if stream_id in active_streams:
         active_streams[stream_id]["last_access"] = time.time()
     
     try:
         response = send_from_directory(os.path.join(HLS_DIR, stream_id), filename)
-        # 允许跨域，方便嵌入其他网页
         response.headers['Access-Control-Allow-Origin'] = '*'
-        # 禁用缓存，保证直播实时性
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
         return response
     except FileNotFoundError:
         return abort(404)
 
 if __name__ == '__main__':
-    # 监听 0.0.0.0 是 Docker 容器被外部访问的关键
     app.run(host='0.0.0.0', port=PORT, threaded=True)
